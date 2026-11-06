@@ -70,17 +70,32 @@ pub(super) struct ZlibStream {
 }
 
 impl ZlibStream {
-    pub(crate) fn new() -> Self {
+    /// photo-gallery: upstream's `new` (which went with its last caller), in a decompressor kept from an earlier
+    /// stream ([`Self::into_state`]) and reset to a new one's state, or a new one.
+    pub(crate) fn with_state(state: Option<Box<Decompressor>>) -> Self {
+        let state = match state {
+            Some(mut state) => {
+                state.reset();
+                state
+            }
+            None => Box::new(Decompressor::new()),
+        };
         ZlibStream {
-            state: Box::new(Decompressor::new()),
+            state,
             started: false,
             ignore_adler32: true,
         }
     }
 
+    /// photo-gallery: the decompressor, for [`Self::with_state`].
+    pub(crate) fn into_state(self) -> Box<Decompressor> {
+        self.state
+    }
+
     pub(crate) fn reset(&mut self) {
         self.started = false;
-        *self.state = Decompressor::new();
+        // photo-gallery: reset in place (the same state as a new one), keeping its tables' allocations.
+        self.state.reset();
     }
 
     /// Set the `ignore_adler32` flag and return `true` if the flag was

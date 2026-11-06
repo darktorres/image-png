@@ -1,21 +1,3 @@
-## Unreleased
-
-### Additions
-
-* Added support for reading and writing the `oFFs` chunk, which records the
-  image's offset relative to a larger page or screen. The parsed value is
-  exposed as `Info::image_offset` and can be set on the encoder via
-  `Encoder::set_image_offset`. ([#645])
-
-### Fixes
-
-* Reject `Encoder::with_info` calls whose `info.interlaced` is `true` with
-  a clear `InterlacedEncodingUnsupported` format error. Previously the IHDR
-  was written with `interlace_method = 1` but `write_image_data` wrote
-  non-interlaced IDAT bytes, producing a PNG that every decoder (including
-  this crate's own) rejected with `UnknownFilterMethod(n)`. Interlaced
-  (Adam7) encoding is a distinct feature that is not yet implemented.
-
 ## 0.18.1
 
 ### Additions
@@ -50,7 +32,6 @@
 [#632]: https://github.com/image-rs/image-png/pull/632
 [#633]: https://github.com/image-rs/image-png/pull/633
 [#635]: https://github.com/image-rs/image-png/pull/635
-[#645]: https://github.com/image-rs/image-png/issues/645
 [#646]: https://github.com/image-rs/image-png/pull/646
 [#647]: https://github.com/image-rs/image-png/pull/647
 [#650]: https://github.com/image-rs/image-png/pull/650

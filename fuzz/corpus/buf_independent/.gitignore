@@ -1,5 +1,0 @@
-# Keep regressions
-!regressions/**
-
-# Otherwise ignore the local corpus
-*

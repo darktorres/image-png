@@ -86,6 +86,8 @@ pub use crate::adam7::{Adam7Info, Adam7Variant};
 pub use crate::common::*;
 pub use crate::decoder::stream::{DecodeOptions, Decoded, DecodingError, StreamingDecoder};
 pub use crate::decoder::{Decoder, InterlaceInfo, InterlacedRow, Limits, OutputInfo, Reader};
+// photo-gallery: decoder buffers kept from one image to the next.
+pub use crate::decoder::Scratch;
 pub use crate::decoder::{UnfilterBuf, UnfilterRegion};
 pub use crate::encoder::{Encoder, EncodingError, StreamWriter, Writer};
 pub use crate::filter::Filter;

@@ -1,8 +1,10 @@
-use super::stream::{DecodeOptions, Decoded, DecodingError, FormatErrorInner, StreamingDecoder};
+use super::stream::{
+    DecodeOptions, Decoded, DecodingError, FormatErrorInner, StreamBuffers, StreamingDecoder,
+};
 use super::zlib::UnfilterBuf;
 use super::Limits;
 
-use std::io::{BufRead, ErrorKind, Read};
+use std::io::{BufRead, ErrorKind, Read, Seek};
 
 use crate::chunk;
 use crate::common::Info;
@@ -21,12 +23,19 @@ pub(crate) struct ReadDecoder<R: Read> {
     decoder: StreamingDecoder,
 }
 
-impl<R: BufRead> ReadDecoder<R> {
-    pub fn new(r: R) -> Self {
+impl<R: BufRead + Seek> ReadDecoder<R> {
+    /// photo-gallery: upstream's `new`, in buffers kept from an earlier image (`new` itself went with its last
+    /// caller).
+    pub fn with_buffers(r: R, buffers: StreamBuffers) -> Self {
         Self {
             reader: r,
-            decoder: StreamingDecoder::new(),
+            decoder: StreamingDecoder::with_buffers(DecodeOptions::default(), buffers),
         }
+    }
+
+    /// photo-gallery: the buffers, for [`Self::with_buffers`].
+    pub fn into_buffers(self) -> StreamBuffers {
+        self.decoder.into_buffers()
     }
 
     pub fn with_options(r: R, options: DecodeOptions) -> Self {

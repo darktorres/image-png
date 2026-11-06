@@ -6,12 +6,10 @@ use std::{borrow, error, fmt, io, mem, ops, result};
 use crc32fast::Hasher as Crc32;
 use flate2::write::ZlibEncoder;
 
-use crate::adam7::Adam7Iterator;
 use crate::chunk::{self, ChunkType};
 use crate::common::{
     AnimationControl, BitDepth, BlendOp, BytesPerPixel, ColorType, Compression, DisposeOp,
-    FrameControl, ImageOffset, Info, OffsetUnit, ParameterError, ParameterErrorKind,
-    PixelDimensions, ScaledFloat, Unit,
+    FrameControl, Info, ParameterError, ParameterErrorKind, PixelDimensions, ScaledFloat, Unit,
 };
 use crate::filter::{filter, Filter};
 use crate::text_metadata::{
@@ -51,7 +49,6 @@ enum FormatErrorKind {
     MissingData(usize),
     Unrecoverable,
     BadTextEncoding(TextEncodingError),
-    InterlacedEncodingUnsupported,
 }
 
 impl error::Error for EncodingError {
@@ -111,10 +108,6 @@ impl fmt::Display for FormatError {
                     write!(fmt, "Unable to compress text metadata")
                 }
             },
-            InterlacedEncodingUnsupported => write!(
-                fmt,
-                "Interlaced (Adam7) encoding is not yet supported; set `info.interlaced = false`"
-            ),
         }
     }
 }
@@ -127,7 +120,7 @@ impl From<io::Error> for EncodingError {
 
 impl From<EncodingError> for io::Error {
     fn from(err: EncodingError) -> io::Error {
-        io::Error::other(err.to_string())
+        io::Error::new(io::ErrorKind::Other, err.to_string())
     }
 }
 
@@ -166,7 +159,6 @@ struct Options {
     sep_def_img: bool,
     validate_sequence: bool,
     compression: DeflateCompression,
-    interlace: bool,
 }
 
 impl<'a, W: Write> Encoder<'a, W> {
@@ -191,11 +183,8 @@ impl<'a, W: Write> Encoder<'a, W> {
 
         Ok(Encoder {
             w,
-            options: Options {
-                interlace: info.interlaced,
-                ..Options::default()
-            },
             info,
+            options: Options::default(),
         })
     }
 
@@ -423,9 +412,6 @@ impl<'a, W: Write> Encoder<'a, W> {
     pub fn set_pixel_dims(&mut self, pixel_dims: Option<PixelDimensions>) {
         self.info.pixel_dims = pixel_dims
     }
-    pub fn set_image_offset(&mut self, image_offset: Option<ImageOffset>) {
-        self.info.image_offset = image_offset
-    }
     /// Convenience function to add tEXt chunks to [`Info`] struct
     pub fn add_text_chunk(&mut self, keyword: String, text: String) -> Result<()> {
         let text_chunk = TEXtChunk::new(keyword, text);
@@ -462,12 +448,6 @@ impl<'a, W: Write> Encoder<'a, W> {
     /// (It's possible to circumvent these checks by writing raw chunks instead.)
     pub fn validate_sequence(&mut self, validate: bool) {
         self.options.validate_sequence = validate;
-    }
-
-    /// Set the use of Adam7 interlacing when encoding an image.
-    pub fn set_interlaced(&mut self, interlace: bool) {
-        self.options.interlace = interlace;
-        self.info.interlaced = interlace;
     }
 }
 
@@ -550,33 +530,6 @@ pub(crate) fn write_chunk<W: Write>(mut w: W, name: chunk::ChunkType, data: &[u8
     Ok(())
 }
 
-/// Writes an `fdAT` chunk without copying its sequence number and data into one buffer.
-fn write_fdat_chunk<W: Write>(
-    mut w: W,
-    sequence_number: u32,
-    compressed_data: &[u8],
-) -> Result<()> {
-    let length = u32::try_from(compressed_data.len())
-        .ok()
-        .and_then(|length| length.checked_add(4))
-        .ok_or(EncodingError::LimitsExceeded)?;
-    let sequence_number = sequence_number.to_be_bytes();
-
-    let mut header = [0; 12];
-    header[..4].copy_from_slice(&length.to_be_bytes());
-    header[4..8].copy_from_slice(&chunk::fdAT.0);
-    header[8..].copy_from_slice(&sequence_number);
-
-    w.write_all(&header)?;
-    w.write_all(compressed_data)?;
-
-    let mut crc = Crc32::new();
-    crc.update(&header[4..]);
-    crc.update(compressed_data);
-    w.write_be(crc.finalize())?;
-    Ok(())
-}
-
 impl<W: Write> Writer<W> {
     fn new(w: W, info: PartialInfo, options: Options) -> Writer<W> {
         Writer {
@@ -609,18 +562,6 @@ impl<W: Write> Writer<W> {
             ));
         }
 
-        // `write_image_data` does not apply Adam7 passes to the supplied raw
-        // pixel buffer, so advertising `interlace_method = 1` in IHDR while
-        // writing non-interlaced IDAT silently produces a corrupt PNG that
-        // decoders reject (as an `UnknownFilterMethod` when a pixel byte
-        // lines up with a pass's filter-byte position). Reject the request
-        // rather than emit bytes that no decoder can read back.
-        if info.interlaced != self.options.interlace {
-            return Err(EncodingError::Format(
-                FormatErrorKind::InterlacedEncodingUnsupported.into(),
-            ));
-        }
-
         self.encode_header(info)?;
 
         Ok(self)
@@ -649,18 +590,6 @@ impl<W: Write> Writer<W> {
                 Unit::Unspecified => phys_data[8] = 0,
             }
             self.write_chunk(chunk::pHYs, &phys_data)?;
-        }
-
-        // Encode the oFFs chunk
-        if let Some(off) = info.image_offset {
-            let mut offs_data = [0; 9];
-            offs_data[0..4].copy_from_slice(&off.x.to_be_bytes());
-            offs_data[4..8].copy_from_slice(&off.y.to_be_bytes());
-            match off.unit {
-                OffsetUnit::Pixel => offs_data[8] = 0,
-                OffsetUnit::Micrometer => offs_data[8] = 1,
-            }
-            self.write_chunk(chunk::oFFs, &offs_data)?;
         }
 
         // If specified, the sRGB information overrides the source gamma and chromaticities.
@@ -728,6 +657,8 @@ impl<W: Write> Writer<W> {
     /// the length of `data` can't be parsed as a `u32` though the length of the chunk data should
     /// not exceed `i32::MAX` or 2,147,483,647.
     pub fn write_chunk(&mut self, name: ChunkType, data: &[u8]) -> Result<()> {
+        use std::convert::TryFrom;
+
         if u32::try_from(data.len()).map_or(true, |length| length > i32::MAX as u32) {
             let kind = FormatErrorKind::WrittenTooMuch(data.len() - i32::MAX as usize);
             return Err(EncodingError::Format(kind.into()));
@@ -815,18 +746,18 @@ impl<W: Write> Writer<W> {
 
         self.validate_new_image()?;
 
-        let width: u32;
-        let height: u32;
+        let width: usize;
+        let height: usize;
         if let Some(ref mut fctl) = self.info.frame_control {
-            width = fctl.width;
-            height = fctl.height;
+            width = fctl.width as usize;
+            height = fctl.height as usize;
         } else {
-            width = self.info.width;
-            height = self.info.height;
+            width = self.info.width as usize;
+            height = self.info.height as usize;
         }
 
-        let in_len = self.info.raw_row_length_from_width(width) - 1;
-        let data_size = in_len * height as usize;
+        let in_len = self.info.raw_row_length_from_width(width as u32) - 1;
+        let data_size = in_len * height;
         if data_size != data.len() {
             return Err(EncodingError::Parameter(
                 ParameterErrorKind::ImageBufferSize {
@@ -837,7 +768,68 @@ impl<W: Write> Writer<W> {
             ));
         }
 
-        let zlib_encoded = self.zlib_encode_image_data(data, (width, height))?;
+        let prev = vec![0; in_len];
+        let mut prev = prev.as_slice();
+
+        let bpp = self.info.bpp_in_prediction();
+        let filter_method = self.options.filter;
+
+        let zlib_encoded = match self.options.compression {
+            DeflateCompression::NoCompression => {
+                let mut compressor =
+                    fdeflate::StoredOnlyCompressor::new(std::io::Cursor::new(Vec::new()))?;
+                for line in data.chunks(in_len) {
+                    compressor.write_data(&[0])?;
+                    compressor.write_data(line)?;
+                }
+                compressor.finish()?.into_inner()
+            }
+            DeflateCompression::FdeflateUltraFast => {
+                let mut compressor = fdeflate::Compressor::new(std::io::Cursor::new(Vec::new()))?;
+
+                let mut current = vec![0; in_len + 1];
+                for line in data.chunks(in_len) {
+                    let filter_type = filter(filter_method, bpp, prev, line, &mut current[1..]);
+
+                    current[0] = filter_type as u8;
+                    compressor.write_data(&current)?;
+                    prev = line;
+                }
+
+                let compressed = compressor.finish()?.into_inner();
+                if compressed.len()
+                    > fdeflate::StoredOnlyCompressor::<()>::compressed_size((in_len + 1) * height)
+                {
+                    // Write uncompressed data since the result from fast compression would take
+                    // more space than that.
+                    //
+                    // This is essentially a fallback to NoCompression.
+                    let mut compressor =
+                        fdeflate::StoredOnlyCompressor::new(std::io::Cursor::new(Vec::new()))?;
+                    for line in data.chunks(in_len) {
+                        compressor.write_data(&[0])?;
+                        compressor.write_data(line)?;
+                    }
+                    compressor.finish()?.into_inner()
+                } else {
+                    compressed
+                }
+            }
+            DeflateCompression::Level(level) => {
+                let mut current = vec![0; in_len];
+
+                let mut zlib =
+                    ZlibEncoder::new(Vec::new(), flate2::Compression::new(u32::from(level)));
+                for line in data.chunks(in_len) {
+                    let filter_type = filter(filter_method, bpp, prev, line, &mut current);
+
+                    zlib.write_all(&[filter_type as u8])?;
+                    zlib.write_all(&current)?;
+                    prev = line;
+                }
+                zlib.finish()?
+            }
+        };
 
         match self.info.frame_control {
             None => {
@@ -855,8 +847,12 @@ impl<W: Write> Writer<W> {
                 if self.images_written == 0 {
                     self.write_zlib_encoded_idat(&zlib_encoded)?;
                 } else {
+                    let buff_size = zlib_encoded.len().min(Self::MAX_fdAT_CHUNK_LEN as usize);
+                    let mut alldata = vec![0u8; 4 + buff_size];
                     for chunk in zlib_encoded.chunks(Self::MAX_fdAT_CHUNK_LEN as usize) {
-                        write_fdat_chunk(&mut self.w, fctl.sequence_number, chunk)?;
+                        alldata[..4].copy_from_slice(&fctl.sequence_number.to_be_bytes());
+                        alldata[4..][..chunk.len()].copy_from_slice(chunk);
+                        write_chunk(&mut self.w, chunk::fdAT, &alldata[..4 + chunk.len()])?;
                         fctl.sequence_number = fctl.sequence_number.wrapping_add(1);
                     }
                 }
@@ -866,167 +862,6 @@ impl<W: Write> Writer<W> {
         self.increment_images_written();
 
         Ok(())
-    }
-
-    fn zlib_encode_image_data(&self, data: &[u8], (width, height): (u32, u32)) -> Result<Vec<u8>> {
-        #[derive(Clone)]
-        enum LineCursor<'lt> {
-            All {
-                lines: core::slice::ChunksExact<'lt, u8>,
-                prev: &'lt [u8],
-            },
-            Interlaced {
-                data: &'lt [u8],
-                data_pitch: usize,
-                adam7: Adam7Iterator,
-                buffer: Vec<u8>,
-                prev: Vec<u8>,
-                bpp: u8,
-            },
-        }
-
-        impl LineCursor<'_> {
-            fn next_pass_and_line(&mut self) -> Option<(u8, &'_ [u8], &'_ [u8])> {
-                match self {
-                    LineCursor::All { lines, prev } => {
-                        let line = lines.next()?;
-                        let prev = core::mem::replace(prev, line);
-                        Some((0, line, prev))
-                    }
-                    LineCursor::Interlaced {
-                        data,
-                        data_pitch,
-                        buffer,
-                        prev,
-                        adam7,
-                        bpp,
-                    } => {
-                        let info = adam7.next()?;
-                        let used =
-                            crate::adam7::sample_pass(data, *data_pitch, buffer, &info, *bpp);
-                        Some((info.pass, &buffer[..used], prev))
-                    }
-                }
-            }
-
-            fn remember_previous(&mut self) {
-                match self {
-                    LineCursor::All { .. } => { /* nothing todo */ }
-                    LineCursor::Interlaced { buffer, prev, .. } => {
-                        prev.clear();
-                        prev.extend_from_slice(buffer);
-                    }
-                }
-            }
-        }
-
-        let in_len = self.info.raw_row_length_from_width(width) - 1;
-        let zeroed_prev = vec![0; in_len];
-
-        let bpp = self.info.bpp_in_prediction();
-        let filter_method = self.options.filter;
-
-        // The filter loop below is used for interlaced and regular lines, as write of the lines and
-        // filtering depends on compression settings. The prediction needs to be reset between
-        // passes so this avoids type modelling.
-        //
-        // Denotes the pass associated with `prev`, requiring a reset when changed.
-        let mut filter_pass = 0;
-        // Iterator we use when not interlacing.
-        let mut interlaced_lines = if self.options.interlace {
-            LineCursor::Interlaced {
-                data,
-                data_pitch: in_len,
-                adam7: Adam7Iterator::new(width, height),
-                buffer: vec![],
-                prev: vec![],
-                bpp: self.info.color_type.bits_per_pixel(self.info.bit_depth) as u8,
-            }
-        } else {
-            let lines = data.chunks_exact(in_len);
-            LineCursor::All {
-                lines,
-                prev: zeroed_prev.as_slice(),
-            }
-        };
-
-        let residual = match self.options.compression {
-            DeflateCompression::NoCompression => {
-                let mut compressor =
-                    fdeflate::StoredOnlyCompressor::new(std::io::Cursor::new(Vec::new()))?;
-
-                while let Some((_pass, line, _prev)) = interlaced_lines.next_pass_and_line() {
-                    compressor.write_data(&[0])?;
-                    compressor.write_data(line)?;
-                }
-
-                compressor.finish()?.into_inner()
-            }
-            DeflateCompression::FdeflateUltraFast => {
-                let mut compressor = fdeflate::Compressor::new(std::io::Cursor::new(Vec::new()))?;
-
-                let fallback_cursor = interlaced_lines.clone();
-                let mut current = vec![0; in_len + 1];
-                while let Some((pass, line, mut prev)) = interlaced_lines.next_pass_and_line() {
-                    if pass != filter_pass {
-                        current.resize(1 + line.len(), 0u8);
-                        prev = &zeroed_prev[..line.len()];
-                        filter_pass = pass;
-                    }
-
-                    let filter_type = filter(filter_method, bpp, prev, line, &mut current[1..]);
-                    current[0] = filter_type as u8;
-                    compressor.write_data(&current)?;
-
-                    interlaced_lines.remember_previous();
-                }
-
-                let compressed = compressor.finish()?.into_inner();
-                let lines = data.len().checked_div(in_len).unwrap_or(0);
-
-                if compressed.len()
-                    > fdeflate::StoredOnlyCompressor::<()>::compressed_size((in_len + 1) * lines)
-                {
-                    let mut fallback_cursor = fallback_cursor;
-                    // Write uncompressed data since the result from fast compression would take
-                    // more space than that.
-                    //
-                    // This is essentially a fallback to NoCompression.
-                    let mut compressor =
-                        fdeflate::StoredOnlyCompressor::new(std::io::Cursor::new(Vec::new()))?;
-                    while let Some((_pass, line, _prev)) = fallback_cursor.next_pass_and_line() {
-                        compressor.write_data(&[0])?;
-                        compressor.write_data(line)?;
-                    }
-                    compressor.finish()?.into_inner()
-                } else {
-                    compressed
-                }
-            }
-            DeflateCompression::Level(level) => {
-                let mut current = vec![0; in_len];
-
-                let mut zlib =
-                    ZlibEncoder::new(Vec::new(), flate2::Compression::new(u32::from(level)));
-
-                while let Some((pass, line, mut prev)) = interlaced_lines.next_pass_and_line() {
-                    if pass != filter_pass {
-                        current.resize(line.len(), 0u8);
-                        prev = &zeroed_prev[..line.len()];
-                        filter_pass = pass;
-                    }
-
-                    let filter_type = filter(filter_method, bpp, prev, line, &mut current);
-                    zlib.write_all(&[filter_type as u8])?;
-                    zlib.write_all(&current)?;
-
-                    interlaced_lines.remember_previous();
-                }
-                zlib.finish()?
-            }
-        };
-
-        Ok(residual)
     }
 
     fn increment_images_written(&mut self) {
@@ -1342,10 +1177,10 @@ impl<'a, W: Write> ChunkWriter<'a, W> {
         // TODO (maybe): find a way to hold two chunks at a time if `usize`
         //               is 64 bits.
         const CAP: usize = u32::MAX as usize >> 1;
-        let curr_chunk = if writer.images_written > 0 && writer.info.frame_control.is_some() {
-            chunk::fdAT
-        } else {
+        let curr_chunk = if writer.images_written == 0 {
             chunk::IDAT
+        } else {
+            chunk::fdAT
         };
         ChunkWriter {
             writer,
@@ -1386,18 +1221,17 @@ impl<'a, W: Write> ChunkWriter<'a, W> {
         assert_eq!(self.index, 0, "Called when not flushed");
         let wrt = self.writer.deref_mut();
 
-        self.curr_chunk = if wrt.images_written > 0 && wrt.info.frame_control.is_some() {
-            chunk::fdAT
-        } else {
+        self.curr_chunk = if wrt.images_written == 0 {
             chunk::IDAT
+        } else {
+            chunk::fdAT
         };
 
         match wrt.info.frame_control {
             Some(_) if wrt.should_skip_frame_control_on_default_image() => {}
             Some(ref mut fctl) => {
                 fctl.encode(&mut wrt.w)?;
-                fctl.sequence_number = fctl.sequence_number.wrapping_add(1);
-                wrt.animation_written += 1;
+                fctl.sequence_number += 1;
             }
             _ => {}
         }
@@ -1444,11 +1278,17 @@ impl<'a, W: Write> Write for ChunkWriter<'a, W> {
         }
 
         // index == 0 means a chunk has been flushed out
-        if self.index == 0 && self.curr_chunk == chunk::fdAT {
-            let fctl = self.writer.info.frame_control.as_mut().unwrap();
-            self.buffer[0..4].copy_from_slice(&fctl.sequence_number.to_be_bytes());
-            fctl.sequence_number = fctl.sequence_number.wrapping_add(1);
-            self.index = 4;
+        if self.index == 0 {
+            let wrt = self.writer.deref_mut();
+
+            // Prepare the next animated frame, if any.
+            let no_fctl = wrt.should_skip_frame_control_on_default_image();
+            if wrt.info.frame_control.is_some() && !no_fctl {
+                let fctl = wrt.info.frame_control.as_mut().unwrap();
+                self.buffer[0..4].copy_from_slice(&fctl.sequence_number.to_be_bytes());
+                fctl.sequence_number += 1;
+                self.index = 4;
+            }
         }
 
         // Cap the buffer length to the maximum number of bytes that can't still
@@ -1478,14 +1318,25 @@ impl<W: Write> Drop for ChunkWriter<'_, W> {
     }
 }
 
-/// State of the current frame in a [`StreamWriter`].
+// TODO: find a better name
+//
+/// This enum is used to be allow the `StreamWriter` to keep
+/// its inner `ChunkWriter` without wrapping it inside a
+/// `ZlibEncoder`. This is used in the case that between the
+/// change of state that happens when the last write of a frame
+/// is performed an error occurs, which obviously has to be returned.
+/// This creates the problem of where to store the writer before
+/// exiting the function, and this is where `Wrapper` comes in.
 ///
-/// `Ready` holds the chunk writer before a frame is started and between
-/// completed frames. The compression variants hold a frame in progress.
-/// `Unrecoverable` records that finishing a compressor failed and lost its
-/// chunk writer.
-enum FrameState<'a, W: Write> {
-    Ready(ChunkWriter<'a, W>),
+/// Unfortunately the `ZlibWriter` can't be used because on the
+/// write following the error, `finish` would be called and that
+/// would write some data even if 0 bytes where compressed.
+///
+/// If the `finish` function fails then there is nothing much to
+/// do as the `ChunkWriter` would get lost so the `Unrecoverable`
+/// variant is used to signal that.
+enum Wrapper<'a, W: Write> {
+    Chunk(ChunkWriter<'a, W>),
     Flate2(ZlibEncoder<ChunkWriter<'a, W>>),
     FDeflate(fdeflate::Compressor<ChunkWriter<'a, W>>),
     Unrecoverable,
@@ -1493,26 +1344,26 @@ enum FrameState<'a, W: Write> {
     None,
 }
 
-impl<'a, W: Write> FrameState<'a, W> {
+impl<'a, W: Write> Wrapper<'a, W> {
     fn from_level(writer: ChunkWriter<'a, W>, compression: DeflateCompression) -> io::Result<Self> {
         Ok(match compression {
             DeflateCompression::NoCompression => {
-                FrameState::Flate2(ZlibEncoder::new(writer, flate2::Compression::none()))
+                Wrapper::Flate2(ZlibEncoder::new(writer, flate2::Compression::none()))
             }
             DeflateCompression::FdeflateUltraFast => {
-                FrameState::FDeflate(fdeflate::Compressor::new(writer)?)
+                Wrapper::FDeflate(fdeflate::Compressor::new(writer)?)
             }
-            DeflateCompression::Level(level) => FrameState::Flate2(ZlibEncoder::new(
+            DeflateCompression::Level(level) => Wrapper::Flate2(ZlibEncoder::new(
                 writer,
                 flate2::Compression::new(u32::from(level)),
             )),
         })
     }
 
-    /// Like `Option::take` this returns the `FrameState` contained
-    /// in `self` and replaces it with `FrameState::None`
-    fn take(&mut self) -> FrameState<'a, W> {
-        let mut swap = FrameState::None;
+    /// Like `Option::take` this returns the `Wrapper` contained
+    /// in `self` and replaces it with `Wrapper::None`
+    fn take(&mut self) -> Wrapper<'a, W> {
+        let mut swap = Wrapper::None;
         mem::swap(self, &mut swap);
         swap
     }
@@ -1521,13 +1372,14 @@ impl<'a, W: Write> FrameState<'a, W> {
 /// Streaming PNG writer
 ///
 /// This may silently fail in the destructor, so it is a good idea to call
-/// [`finish`] before dropping.
+/// [`finish`] or [`flush`] before dropping.
 ///
 /// [`finish`]: Self::finish
+/// [`flush`]: Write::flush
 pub struct StreamWriter<'a, W: Write> {
-    /// Tracks whether a frame is ready to start, currently being compressed, or
-    /// cannot be recovered after a compression error.
-    writer: FrameState<'a, W>,
+    /// The option here is needed in order to access the inner `ChunkWriter` in-between
+    /// each frame, which is needed for writing the fcTL chunks between each frame
+    writer: Wrapper<'a, W>,
     prev_buf: Vec<u8>,
     curr_buf: Vec<u8>,
     filtered_buf: Vec<u8>,
@@ -1549,16 +1401,6 @@ pub struct StreamWriter<'a, W: Write> {
 
 impl<'a, W: Write> StreamWriter<'a, W> {
     fn new(writer: ChunkOutput<'a, W>, buf_len: usize) -> Result<StreamWriter<'a, W>> {
-        // We can not stream-write interlaced data.. That is, you would need to supply data in Adam7
-        // interlaced order yourself instead of in their original line order. This is surprising
-        // enough to warrant another type, or at least function or an explicit opt-in, and also we
-        // do not implement it below.
-        if writer.options.interlace {
-            return Err(EncodingError::Format(
-                FormatErrorKind::InterlacedEncodingUnsupported.into(),
-            ));
-        }
-
         let PartialInfo {
             width,
             height,
@@ -1574,11 +1416,12 @@ impl<'a, W: Write> StreamWriter<'a, W> {
         let curr_buf = vec![0; in_len];
         let filtered_buf = vec![0; in_len];
 
-        let chunk_writer = ChunkWriter::new(writer, buf_len);
+        let mut chunk_writer = ChunkWriter::new(writer, buf_len);
         let (line_len, to_write) = chunk_writer.next_frame_info();
+        chunk_writer.write_header()?;
 
         Ok(StreamWriter {
-            writer: FrameState::Ready(chunk_writer),
+            writer: Wrapper::from_level(chunk_writer, compression)?,
             index: 0,
             prev_buf,
             curr_buf,
@@ -1756,11 +1599,10 @@ impl<'a, W: Write> StreamWriter<'a, W> {
 
     /// Consume the stream writer with validation.
     ///
-    /// Unlike a simple drop this ensures that all data was written correctly. When other
+    /// Unlike a simple drop this ensures that the all data was written correctly. When other
     /// validation options (chunk sequencing) had been turned on in the configuration of inner
     /// [`Writer`], then it will also do a check on their correctness. Differently from
-    /// [`Writer::finish`], this finishes the current frame and returns an error if some data is
-    /// abandoned.
+    /// [`Writer::finish`], this just `flush`es, returns error if some data is abandoned.
     pub fn finish(mut self) -> Result<()> {
         self.finish_mut()
     }
@@ -1768,96 +1610,67 @@ impl<'a, W: Write> StreamWriter<'a, W> {
     /// Internal helper that can be called both from `fn finish(mut self)`
     /// and from `fn drop(&mut self)`.
     fn finish_mut(&mut self) -> Result<()> {
-        if matches!(self.writer, FrameState::None) {
-            return Ok(());
-        }
         if self.to_write > 0 {
             let err = FormatErrorKind::MissingData(self.to_write).into();
             return Err(EncodingError::Format(err));
         }
 
-        if !matches!(self.writer, FrameState::Ready(_)) {
-            self.finish_frame()?;
-        }
+        self.flush()?;
         match self.writer.take() {
-            FrameState::Ready(wrt) => {
+            Wrapper::Chunk(wrt) => {
                 wrt.writer.validate_sequence_done()?;
             }
-            FrameState::None => unreachable!(),
-            FrameState::Unrecoverable => {
+            Wrapper::FDeflate(wrt) => {
+                wrt.finish()?;
+            }
+            Wrapper::Flate2(wrt) => {
+                wrt.finish()?;
+            }
+            Wrapper::None => unreachable!(),
+            Wrapper::Unrecoverable => {
                 let err = FormatErrorKind::Unrecoverable.into();
                 return Err(EncodingError::Format(err));
             }
-            FrameState::FDeflate(_) | FrameState::Flate2(_) => unreachable!(),
         }
 
         Ok(())
     }
 
-    fn finish_frame(&mut self) -> Result<()> {
-        match self.writer.take() {
-            FrameState::FDeflate(wrt) => match wrt.finish() {
-                Ok(chunk) => self.writer = FrameState::Ready(chunk),
-                Err(err) => {
-                    self.writer = FrameState::Unrecoverable;
-                    return Err(err.into());
-                }
-            },
-            FrameState::Flate2(wrt) => match wrt.finish() {
-                Ok(chunk) => self.writer = FrameState::Ready(chunk),
-                Err(err) => {
-                    self.writer = FrameState::Unrecoverable;
-                    return Err(err.into());
-                }
-            },
-            FrameState::Unrecoverable => {
-                self.writer = FrameState::Unrecoverable;
+    /// Flushes the buffered chunk, checks if it was the last frame,
+    /// writes the next frame header and gets the next frame scanline size
+    /// and image size.
+    /// NOTE: This method must only be called when the writer is the variant Chunk(_)
+    fn new_frame(&mut self) -> Result<()> {
+        let wrt = match &mut self.writer {
+            Wrapper::Chunk(wrt) => wrt,
+            Wrapper::Unrecoverable => {
                 let err = FormatErrorKind::Unrecoverable.into();
                 return Err(EncodingError::Format(err));
             }
-            FrameState::Ready(_) => unreachable!("no frame is in progress"),
-            FrameState::None => unreachable!(),
-        }
-
-        let FrameState::Ready(wrt) = &mut self.writer else {
-            unreachable!()
+            Wrapper::Flate2(_) | Wrapper::FDeflate(_) => {
+                unreachable!("never called on a half-finished frame")
+            }
+            Wrapper::None => unreachable!(),
         };
         wrt.flush()?;
-        wrt.writer.increment_images_written();
-        Ok(())
-    }
-
-    fn start_frame(&mut self) -> Result<()> {
-        let wrt = match &mut self.writer {
-            FrameState::Ready(wrt) => wrt,
-            FrameState::Unrecoverable => {
-                let err = FormatErrorKind::Unrecoverable.into();
-                return Err(EncodingError::Format(err));
-            }
-            FrameState::Flate2(_) | FrameState::FDeflate(_) => {
-                unreachable!("a frame is already in progress")
-            }
-            FrameState::None => unreachable!(),
-        };
         wrt.writer.validate_new_image()?;
 
-        if wrt.writer.info.frame_control.is_some() {
-            if let Some(fctl) = self.fctl {
-                wrt.set_fctl(fctl);
-            }
+        if let Some(fctl) = self.fctl {
+            wrt.set_fctl(fctl);
         }
-        let (line_len, to_write) = wrt.next_frame_info();
-        self.prev_buf[..line_len].fill(0);
-        self.line_len = line_len;
-        self.to_write = to_write;
-        self.index = 0;
-        wrt.write_header()?;
+        let (scansize, size) = wrt.next_frame_info();
+        self.line_len = scansize;
+        self.to_write = size;
 
+        wrt.write_header()?;
+        wrt.writer.increment_images_written();
+
+        // now it can be taken because the next statements cannot cause any errors
         match self.writer.take() {
-            FrameState::Ready(wrt) => match FrameState::from_level(wrt, self.compression) {
+            Wrapper::Chunk(wrt) => match Wrapper::from_level(wrt, self.compression) {
                 Ok(writer) => self.writer = writer,
                 Err(err) => {
-                    self.writer = FrameState::Unrecoverable;
+                    self.writer = Wrapper::Unrecoverable;
                     return Err(err.into());
                 }
             },
@@ -1870,7 +1683,7 @@ impl<'a, W: Write> StreamWriter<'a, W> {
 
 impl<'a, W: Write> Write for StreamWriter<'a, W> {
     fn write(&mut self, mut data: &[u8]) -> io::Result<usize> {
-        if let FrameState::Unrecoverable = self.writer {
+        if let Wrapper::Unrecoverable = self.writer {
             let err = FormatErrorKind::Unrecoverable.into();
             return Err(EncodingError::Format(err).into());
         }
@@ -1879,11 +1692,29 @@ impl<'a, W: Write> Write for StreamWriter<'a, W> {
             return Ok(0);
         }
 
-        if matches!(self.writer, FrameState::Ready(_)) {
-            self.start_frame()?;
-        } else if self.to_write == 0 {
-            self.finish_frame()?;
-            self.start_frame()?;
+        if self.to_write == 0 {
+            match self.writer.take() {
+                Wrapper::Flate2(wrt) => match wrt.finish() {
+                    Ok(chunk) => self.writer = Wrapper::Chunk(chunk),
+                    Err(err) => {
+                        self.writer = Wrapper::Unrecoverable;
+                        return Err(err);
+                    }
+                },
+                Wrapper::FDeflate(wrt) => match wrt.finish() {
+                    Ok(chunk) => self.writer = Wrapper::Chunk(chunk),
+                    Err(err) => {
+                        self.writer = Wrapper::Unrecoverable;
+                        return Err(err);
+                    }
+                },
+                chunk @ Wrapper::Chunk(_) => self.writer = chunk,
+                Wrapper::Unrecoverable => unreachable!(),
+                Wrapper::None => unreachable!(),
+            };
+
+            // Transition Wrapper::Chunk to Wrapper::Zlib.
+            self.new_frame()?;
         }
 
         let written = data.read(&mut self.curr_buf[..self.line_len][self.index..])?;
@@ -1900,11 +1731,11 @@ impl<'a, W: Write> Write for StreamWriter<'a, W> {
             );
             // This can't fail as the other variant is used only to allow the zlib encoder to finish
             match &mut self.writer {
-                FrameState::Flate2(wrt) => {
+                Wrapper::Flate2(wrt) => {
                     wrt.write_all(&[filter_type as u8])?;
                     wrt.write_all(&self.filtered_buf)?;
                 }
-                FrameState::FDeflate(wrt) => {
+                Wrapper::FDeflate(wrt) => {
                     wrt.write_data(&[filter_type as u8])?;
                     wrt.write_data(&self.filtered_buf)?;
                 }
@@ -1920,15 +1751,20 @@ impl<'a, W: Write> Write for StreamWriter<'a, W> {
 
     fn flush(&mut self) -> io::Result<()> {
         match &mut self.writer {
-            FrameState::Flate2(wrt) => wrt.flush()?,
-            FrameState::Ready(wrt) => wrt.flush()?,
-            FrameState::FDeflate(_) => (), // TODO: Add `flush()` to `fdeflate::Compressor`?
+            Wrapper::Flate2(wrt) => wrt.flush()?,
+            Wrapper::Chunk(wrt) => wrt.flush()?,
+            Wrapper::FDeflate(_) => (), // TODO: Add `flush()` to `fdeflate::Compressor`?
             // This handles both the case where we entered an unrecoverable state after zlib
             // decoding failure and after a panic while we had taken the chunk/zlib reader.
-            FrameState::Unrecoverable | FrameState::None => {
+            Wrapper::Unrecoverable | Wrapper::None => {
                 let err = FormatErrorKind::Unrecoverable.into();
                 return Err(EncodingError::Format(err).into());
             }
+        }
+
+        if self.index > 0 {
+            let err = FormatErrorKind::WrittenTooMuch(self.index).into();
+            return Err(EncodingError::Format(err).into());
         }
 
         Ok(())
@@ -1947,31 +1783,10 @@ mod tests {
     use crate::Decoder;
 
     use io::BufReader;
-    use rand::{rng, Rng, RngExt};
+    use rand::{rng, Rng};
     use std::cmp;
     use std::fs::File;
     use std::io::Cursor;
-
-    #[test]
-    fn fdat_chunk_matches_contiguous_chunk() {
-        for data_len in [0, 1, 4, 255, 4097] {
-            let data: Vec<_> = (0..data_len).map(|i| i as u8).collect();
-
-            for sequence_number in [0, 1, u32::MAX] {
-                let mut payload = Vec::with_capacity(data.len() + 4);
-                payload.extend_from_slice(&sequence_number.to_be_bytes());
-                payload.extend_from_slice(&data);
-
-                let mut expected = Vec::new();
-                write_chunk(&mut expected, chunk::fdAT, &payload).unwrap();
-
-                let mut actual = Vec::new();
-                write_fdat_chunk(&mut actual, sequence_number, &data).unwrap();
-
-                assert_eq!(actual, expected);
-            }
-        }
-    }
 
     #[test]
     fn roundtrip1() {
@@ -2030,29 +1845,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn offs_chunk_roundtrip() {
-        let offset = ImageOffset {
-            x: -12,
-            y: 34,
-            unit: OffsetUnit::Micrometer,
-        };
-
-        let mut out = Vec::new();
-        {
-            let mut encoder = Encoder::new(&mut out, 1, 1);
-            encoder.set_color(ColorType::Grayscale);
-            encoder.set_depth(BitDepth::Eight);
-            encoder.set_image_offset(Some(offset));
-            let mut writer = encoder.write_header().unwrap();
-            writer.write_image_data(&[0]).unwrap();
-        }
-
-        let decoder = Decoder::new(Cursor::new(&*out));
-        let reader = decoder.read_info().unwrap();
-        assert_eq!(reader.info().image_offset, Some(offset));
     }
 
     #[test]
@@ -2161,51 +1953,6 @@ mod tests {
     }
 
     #[test]
-    fn image_interlacing() -> Result<()> {
-        use DeflateCompression::*;
-        for &bit_depth in &[1u8, 2, 4, 8] {
-            for compress in &[NoCompression, FdeflateUltraFast, Level(4)] {
-                // Get ourselves some data for the depth.
-                let path = format!("tests/pngsuite/basn3p0{}.png", bit_depth);
-                let decoder = Decoder::new(BufReader::new(File::open(&path).unwrap()));
-                let mut reader = decoder.read_info().unwrap();
-                let mut decoded_pixels = vec![0; reader.output_buffer_size().unwrap()];
-                let info = reader.next_frame(&mut decoded_pixels).unwrap();
-                let palette = reader.info().palette.as_ref().unwrap();
-
-                let mut cursor = Cursor::new(vec![]);
-                let mut encoder = Encoder::new(&mut cursor, info.width, info.height);
-                encoder.set_deflate_compression(*compress);
-                encoder.set_depth(info.bit_depth);
-                encoder.set_color(ColorType::Indexed);
-                encoder.set_palette(palette.as_ref());
-
-                // the main property of this test.
-                encoder.set_interlaced(true);
-
-                let mut writer = encoder.write_header()?;
-                writer.write_image_data(&decoded_pixels)?;
-                writer.finish()?;
-
-                cursor.set_position(0);
-                let decoder = Decoder::new(&mut cursor);
-                let mut reader = decoder.read_info().unwrap();
-                let mut redecoded = vec![0; reader.output_buffer_size().unwrap()];
-                let reinfo = reader.next_frame(&mut redecoded);
-                assert_eq!(redecoded.len(), decoded_pixels.len());
-
-                assert!(
-                    reinfo.as_ref().is_ok_and(|i| *i == info),
-                    "{reinfo:?} != {info:?} for compression: {bit_depth}/{compress:?}"
-                );
-
-                assert_eq!(redecoded, decoded_pixels, "{bit_depth}/{compress:?}");
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
     fn expect_error_on_wrong_image_len() -> Result<()> {
         let width = 10;
         let height = 10;
@@ -2298,31 +2045,6 @@ mod tests {
         assert!(encoder.write_header().is_err());
 
         Ok(())
-    }
-
-    #[test]
-    fn expect_error_when_interlacing_is_requested() {
-        // We implement interlace on explicit request by the encoder. The info must agree with the
-        // explicit request.
-        let mut info = Info::with_size(4, 4);
-        info.color_type = ColorType::Rgb;
-        info.bit_depth = BitDepth::Eight;
-        info.interlaced = true;
-
-        let mut out = Vec::new();
-        let encoder = Encoder::with_info(&mut out, info).expect("with_info accepts the Info");
-        let mut writer = encoder.write_header().unwrap();
-        let result = writer.stream_writer();
-        assert!(
-            matches!(result, Err(EncodingError::Format(_))),
-            "expected Format error, got {:?}",
-            result.as_ref().err(),
-        );
-        let msg = result.err().unwrap().to_string();
-        assert!(
-            msg.to_ascii_lowercase().contains("interlac"),
-            "error message should mention interlacing, got: {msg}",
-        );
     }
 
     #[test]
@@ -2577,80 +2299,6 @@ mod tests {
     }
 
     #[test]
-    fn stream_animation_roundtrip() -> Result<()> {
-        let first_frame = [0u8; 64];
-        let second_frame = [0xffu8; 64];
-
-        for compression in [
-            DeflateCompression::NoCompression,
-            DeflateCompression::FdeflateUltraFast,
-            DeflateCompression::Level(4),
-        ] {
-            let mut output = Vec::new();
-            let mut encoder = Encoder::new(&mut output, 8, 8);
-            encoder.set_color(ColorType::Grayscale);
-            encoder.set_depth(BitDepth::Eight);
-            encoder.set_deflate_compression(compression);
-            encoder.set_animated(2, 0)?;
-            encoder.validate_sequence(true);
-            let mut writer = encoder.write_header()?;
-            let mut stream = writer.stream_writer_with_size(8)?;
-
-            stream.set_frame_delay(1, 1)?;
-            stream.write_all(&first_frame)?;
-            stream.set_frame_delay(1, 2)?;
-            stream.write_all(&second_frame)?;
-            stream.finish()?;
-            writer.finish()?;
-
-            let mut reader = Decoder::new(Cursor::new(output)).read_info().unwrap();
-            assert_eq!(reader.info().animation_control.unwrap().num_frames, 2);
-            let mut decoded = [0; 64];
-            reader.next_frame(&mut decoded).unwrap();
-            assert_eq!(decoded, first_frame);
-            assert_eq!(reader.info().frame_control.unwrap().delay_den, 1);
-            reader.next_frame(&mut decoded).unwrap();
-            assert_eq!(decoded, second_frame);
-            assert_eq!(reader.info().frame_control.unwrap().delay_den, 2);
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn stream_animation_with_separate_default_image() -> Result<()> {
-        let default_image = [0x40u8; 16];
-        let first_frame = [0x80u8; 16];
-        let second_frame = [0xc0u8; 16];
-        let mut output = Vec::new();
-
-        let mut encoder = Encoder::new(&mut output, 4, 4);
-        encoder.set_color(ColorType::Grayscale);
-        encoder.set_depth(BitDepth::Eight);
-        encoder.set_animated(2, 0)?;
-        encoder.set_sep_def_img(true)?;
-        encoder.validate_sequence(true);
-        let mut writer = encoder.write_header()?;
-        let mut stream = writer.stream_writer_with_size(8)?;
-        stream.write_all(&default_image)?;
-        stream.write_all(&first_frame)?;
-        stream.write_all(&second_frame)?;
-        stream.finish()?;
-        writer.finish()?;
-
-        let mut reader = Decoder::new(Cursor::new(output)).read_info().unwrap();
-        let mut decoded = [0; 16];
-        reader.next_frame(&mut decoded).unwrap();
-        assert_eq!(decoded, default_image);
-        reader.next_frame(&mut decoded).unwrap();
-        assert_eq!(decoded, first_frame);
-        reader.next_frame(&mut decoded).unwrap();
-        assert_eq!(decoded, second_frame);
-
-        Ok(())
-    }
-
-    #[test]
     fn image_validate_animation_sep_def_image() -> Result<()> {
         let width = 10;
         let height = 10;
@@ -2717,18 +2365,6 @@ mod tests {
     }
 
     #[test]
-    fn stream_validation_rejects_missing_image_data() -> Result<()> {
-        let mut output = Vec::new();
-        let encoder = Encoder::new(&mut output, 1, 1);
-        let mut writer = encoder.write_header()?;
-        let stream = writer.stream_writer()?;
-
-        assert!(stream.finish().is_err());
-
-        Ok(())
-    }
-
-    #[test]
     fn issue_307_stream_validation() -> Result<()> {
         let output = vec![0u8; 1024];
         let mut cursor = Cursor::new(output);
@@ -2749,28 +2385,6 @@ mod tests {
             decoder.next_frame(&mut buffer[..]).expect("Valid read");
             assert_eq!(buffer, [1]);
         }
-
-        Ok(())
-    }
-
-    #[test]
-    fn stream_flushes_partial_scanline() -> Result<()> {
-        let mut output = Vec::new();
-        let mut encoder = Encoder::new(&mut output, 2, 1);
-        encoder.set_color(ColorType::Grayscale);
-        let mut writer = encoder.write_header()?;
-        let mut stream = writer.stream_writer()?;
-
-        assert_eq!(stream.write(&[1])?, 1);
-        stream.flush()?;
-        assert_eq!(stream.write(&[2])?, 1);
-        stream.finish()?;
-        writer.finish()?;
-
-        let mut reader = Decoder::new(Cursor::new(output)).read_info().unwrap();
-        let mut decoded = [0; 2];
-        reader.next_frame(&mut decoded).unwrap();
-        assert_eq!(decoded, [1, 2]);
 
         Ok(())
     }

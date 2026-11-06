@@ -6,11 +6,12 @@ mod unfiltering_buffer;
 mod zlib;
 
 use self::read_decoder::{ImageDataCompletionStatus, ReadDecoder};
+use self::stream::StreamBuffers;
 use self::stream::{DecodeOptions, DecodingError, FormatErrorInner};
 use self::transform::{create_transform_fn, TransformFn};
 use self::unfiltering_buffer::UnfilteringBuffer;
 
-use std::io::BufRead;
+use std::io::{BufRead, Seek};
 use std::mem;
 
 use crate::adam7::Adam7Info;
@@ -87,10 +88,50 @@ impl Default for Limits {
 }
 
 /// PNG Decoder
-pub struct Decoder<R: BufRead> {
+pub struct Decoder<R: BufRead + Seek> {
     read_decoder: ReadDecoder<R>,
     /// Output transformations
     transform: Transformations,
+    /// photo-gallery: the buffers the [`Reader`] will use, kept from an earlier image.
+    rows: RowBuffers,
+}
+
+/// photo-gallery: what a decoder allocates as it reads an image (the chunk buffer, the inflater and its tables, the
+/// buffers rows are unfiltered and returned in, the copies of the chunks `Info` keeps), kept from one image to the
+/// next: [`Decoder::new_with_scratch`], [`Reader::into_scratch`]. A decoder reads in them exactly as in new ones.
+#[derive(Default)]
+pub struct Scratch {
+    stream: StreamBuffers,
+    rows: RowBuffers,
+}
+
+#[derive(Default)]
+struct RowBuffers {
+    unfiltering: Vec<u8>,
+    unfiltering_scratch: Vec<u8>,
+    output: Vec<u8>,
+}
+
+impl Scratch {
+    /// Free the buffers that hold more than `bytes`, after an image far larger than the rest.
+    pub fn trim(&mut self, bytes: usize) {
+        let StreamBuffers {
+            chunk,
+            inflater: _,
+            copies,
+        } = &mut self.stream;
+        let RowBuffers {
+            unfiltering,
+            unfiltering_scratch,
+            output,
+        } = &mut self.rows;
+        for buf in [chunk, unfiltering, unfiltering_scratch, output] {
+            if buf.capacity() > bytes {
+                *buf = Vec::new();
+            }
+        }
+        copies.retain(|c| c.capacity() <= bytes);
+    }
 }
 
 /// A row of data with interlace information attached.
@@ -122,7 +163,7 @@ impl<'data> Row<'data> {
     }
 }
 
-impl<R: BufRead> Decoder<R> {
+impl<R: BufRead + Seek> Decoder<R> {
     /// Create a new decoder configuration with default limits.
     pub fn new(r: R) -> Decoder<R> {
         Decoder::new_with_limits(r, Limits::default())
@@ -130,12 +171,27 @@ impl<R: BufRead> Decoder<R> {
 
     /// Create a new decoder configuration with custom limits.
     pub fn new_with_limits(r: R, limits: Limits) -> Decoder<R> {
-        let mut read_decoder = ReadDecoder::new(r);
+        Self::new_with_scratch(r, limits, Scratch::default())
+    }
+
+    /// photo-gallery: [`Self::new_with_limits`] in the buffers of an earlier image's decoder
+    /// ([`Reader::into_scratch`], [`Decoder::into_scratch`]). It decodes exactly as a new one does.
+    pub fn new_with_scratch(r: R, limits: Limits, scratch: Scratch) -> Decoder<R> {
+        let mut read_decoder = ReadDecoder::with_buffers(r, scratch.stream);
         read_decoder.set_limits(limits);
 
         Decoder {
             read_decoder,
             transform: Transformations::IDENTITY,
+            rows: scratch.rows,
+        }
+    }
+
+    /// photo-gallery: the buffers, for [`Self::new_with_scratch`], when no [`Reader`] was made.
+    pub fn into_scratch(self) -> Scratch {
+        Scratch {
+            stream: self.read_decoder.into_buffers(),
+            rows: self.rows,
         }
     }
 
@@ -147,6 +203,7 @@ impl<R: BufRead> Decoder<R> {
         Decoder {
             read_decoder,
             transform: Transformations::IDENTITY,
+            rows: RowBuffers::default(),
         }
     }
 
@@ -189,11 +246,32 @@ impl<R: BufRead> Decoder<R> {
     }
 
     /// Reads all meta data until the first IDAT chunk
-    pub fn read_info(mut self) -> Result<Reader<R>, DecodingError> {
-        let info = self.read_header_info()?;
-        let unfiltering_buffer = UnfilteringBuffer::new(info);
+    pub fn read_info(self) -> Result<Reader<R>, DecodingError> {
+        self.read_info_or_scratch().map_err(|(err, _)| err)
+    }
 
-        let mut reader = Reader {
+    /// photo-gallery: [`Self::read_info`], which on an error gives back the buffers too
+    /// ([`Self::new_with_scratch`]).
+    pub fn read_info_or_scratch(mut self) -> Result<Reader<R>, (DecodingError, Scratch)> {
+        let rows = mem::take(&mut self.rows);
+        let info = match self.read_header_info() {
+            Ok(info) => info,
+            Err(err) => {
+                self.rows = rows;
+                return Err((err, self.into_scratch()));
+            }
+        };
+        let RowBuffers {
+            unfiltering,
+            unfiltering_scratch,
+            mut output,
+        } = rows;
+        let unfiltering_buffer =
+            UnfilteringBuffer::with_buffers(info, unfiltering, unfiltering_scratch);
+        // Emptied, so that it reads as a new one: `next_interlaced_row` zero-fills it as it grows.
+        output.clear();
+
+        let reader = Reader {
             decoder: self.read_decoder,
             bpp: BytesPerPixel::One,
             subframe: SubframeInfo::not_yet_init(),
@@ -201,9 +279,37 @@ impl<R: BufRead> Decoder<R> {
             unfiltering_buffer,
             transform: self.transform,
             transform_fn: None,
-            scratch_buffer: Vec::new(),
+            scratch_buffer: output,
             finished: false,
         };
+        reader.read_until_first_frame()
+    }
+}
+
+impl<R: BufRead + Seek> Reader<R> {
+    /// photo-gallery: the buffers this reader decoded in, for [`Decoder::new_with_scratch`].
+    pub fn into_scratch(self) -> Scratch {
+        let (unfiltering, unfiltering_scratch) = self.unfiltering_buffer.into_buffers();
+        Scratch {
+            stream: self.decoder.into_buffers(),
+            rows: RowBuffers {
+                unfiltering,
+                unfiltering_scratch,
+                output: self.scratch_buffer,
+            },
+        }
+    }
+
+    /// The rest of `Decoder::read_info` (upstream's, moved here so that an error gives the buffers back).
+    fn read_until_first_frame(mut self) -> Result<Reader<R>, (DecodingError, Scratch)> {
+        if let Err(err) = self.check_sizes_and_read_until_image_data() {
+            return Err((err, self.into_scratch()));
+        }
+        Ok(self)
+    }
+
+    fn check_sizes_and_read_until_image_data(&mut self) -> Result<(), DecodingError> {
+        let reader = self;
 
         // Check if the decoding buffer of a single raw line has a valid size.
         //
@@ -240,8 +346,11 @@ impl<R: BufRead> Decoder<R> {
                 num_frames
             }
         };
-        Ok(reader)
+        Ok(())
     }
+}
+
+impl<R: BufRead + Seek> Decoder<R> {
 
     /// Set the allowed and performed transformations.
     ///
@@ -291,7 +400,7 @@ impl<R: BufRead> Decoder<R> {
 /// PNG reader (mostly high-level interface)
 ///
 /// Provides a high level that iterates over lines or whole images.
-pub struct Reader<R: BufRead> {
+pub struct Reader<R: BufRead + Seek> {
     decoder: ReadDecoder<R>,
     bpp: BytesPerPixel,
     subframe: SubframeInfo,
@@ -327,7 +436,7 @@ struct SubframeInfo {
     consumed_and_flushed: bool,
 }
 
-impl<R: BufRead> Reader<R> {
+impl<R: BufRead + Seek> Reader<R> {
     /// Advances to the start of the next animation frame and
     /// returns a reference to the [`FrameControl`] info that describes it.
     /// Skips and discards the image data of the previous frame if necessary.
@@ -451,7 +560,7 @@ impl<R: BufRead> Reader<R> {
         };
 
         if self.info().interlaced {
-            let stride = self.unguarded_output_line_size(self.subframe.width);
+            let stride = self.unguarded_output_line_size(self.info().width);
             let samples = color_type.samples() as u8;
             let bits_pp = samples * (bit_depth as u8);
             let expand = crate::adam7::expand_pass;
@@ -761,5 +870,200 @@ impl SubframeInfo {
             interlace_info_iter,
             consumed_and_flushed: false,
         }
+    }
+}
+
+/// photo-gallery: tests of decoding in kept buffers ([`Scratch`]).
+#[cfg(test)]
+mod photo_gallery {
+    use super::*;
+    use crate::Transformations;
+    use std::io::Cursor;
+
+    fn noise(len: usize, seed: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| ((i ^ seed).wrapping_mul(2654435761) >> 13) as u8)
+            .collect()
+    }
+
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend((data.len() as u32).to_be_bytes());
+        out.extend(kind);
+        out.extend(data);
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(kind);
+        crc.update(data);
+        out.extend(crc.finalize().to_be_bytes());
+    }
+
+    /// A PNG made by hand: random rows behind random filters (so every filter is undone), Adam7 passes when
+    /// interlaced, its data split over several `IDAT` chunks, and the given chunks before it.
+    fn png(w: u32, h: u32, color: u8, depth: u8, interlaced: bool, extra: &[(&[u8; 4], Vec<u8>)], seed: usize) -> Vec<u8> {
+        let samples = match color {
+            0 | 3 => 1,
+            4 => 2,
+            2 => 3,
+            _ => 4,
+        };
+        let row_bytes = |width: u32| (width as usize * samples * depth as usize).div_ceil(8);
+        let passes: Vec<(u32, u32)> = if interlaced {
+            [(0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2)]
+                .iter()
+                .map(|&(x, y, dx, dy)| ((w + dx - 1 - x) / dx, (h + dy - 1 - y) / dy))
+                .collect()
+        } else {
+            vec![(w, h)]
+        };
+        let mut raw = Vec::new();
+        for (i, &(pw, ph)) in passes.iter().enumerate() {
+            if pw == 0 || ph == 0 {
+                continue;
+            }
+            for row in 0..ph as usize {
+                let filter = noise(1, seed + i * 1000 + row)[0] % 5;
+                raw.push(filter);
+                raw.extend(noise(row_bytes(pw), seed ^ (i * 7919 + row * 31)));
+            }
+        }
+        let compressed = fdeflate::compress_to_vec(&raw);
+        let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut ihdr = Vec::new();
+        ihdr.extend(w.to_be_bytes());
+        ihdr.extend(h.to_be_bytes());
+        ihdr.extend([depth, color, 0, 0, interlaced as u8]);
+        chunk(&mut out, b"IHDR", &ihdr);
+        for (kind, data) in extra {
+            chunk(&mut out, kind, data);
+        }
+        for part in compressed.chunks(1000) {
+            chunk(&mut out, b"IDAT", part);
+        }
+        chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    /// Everything a decode gives: the frames (or the error), and what `Info` kept.
+    #[derive(PartialEq, Debug)]
+    struct Decoded {
+        frames: Vec<Result<(u32, u32, Vec<u8>), String>>,
+        kept: Vec<Option<Vec<u8>>>,
+    }
+
+    /// Decode every frame of `bytes`, in `scratch` or new buffers; the scratch comes back.
+    fn decode(bytes: &[u8], transform: Transformations, limit: usize, ignore_text: bool, scratch: Scratch) -> (Decoded, Scratch) {
+        let mut decoder = Decoder::new_with_scratch(Cursor::new(bytes), Limits { bytes: limit }, scratch);
+        decoder.set_transformations(transform);
+        decoder.set_ignore_text_chunk(ignore_text);
+        let mut reader = match decoder.read_info_or_scratch() {
+            Ok(reader) => reader,
+            Err((err, scratch)) => {
+                let decoded = Decoded { frames: vec![Err(err.to_string())], kept: Vec::new() };
+                return (decoded, scratch);
+            }
+        };
+        let mut frames = Vec::new();
+        loop {
+            let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+            let frame = reader.next_frame(&mut buf).map(|o| (o.width, o.height, buf)).map_err(|e| e.to_string());
+            let end = frame.is_err();
+            frames.push(frame);
+            if end {
+                break;
+            }
+        }
+        let info = reader.info();
+        let kept = [&info.palette, &info.trns, &info.sbit, &info.bkgd, &info.exif_metadata, &info.icc_profile]
+            .map(|c| c.as_ref().map(|c| c.to_vec()))
+            .to_vec();
+        (Decoded { frames, kept }, reader.into_scratch())
+    }
+
+    fn files() -> Vec<Vec<u8>> {
+        let mut files = Vec::new();
+        let exif = noise(50_000, 3);
+        for (color, depths) in [(0u8, &[1u8, 2, 4, 8, 16][..]), (2, &[8, 16]), (3, &[1, 2, 4, 8]), (4, &[8, 16]), (6, &[8, 16])] {
+            for &depth in depths {
+                for interlaced in [false, true] {
+                    for (w, h) in [(1, 1), (37, 23), (300, 9)] {
+                        let mut extra: Vec<(&[u8; 4], Vec<u8>)> = Vec::new();
+                        if color == 3 {
+                            extra.push((b"PLTE", noise(3 << depth, 5)));
+                            extra.push((b"tRNS", noise(1 << (depth - 1), 6)));
+                        } else if color == 0 || color == 2 {
+                            let n = if color == 0 { 2 } else { 6 };
+                            extra.push((b"tRNS", vec![0; n]));
+                            extra.push((b"bKGD", vec![0; n]));
+                        }
+                        if depth == 8 {
+                            let n = if color == 3 { 3 } else { [1, 0, 3, 0, 2, 0, 4][color as usize] };
+                            extra.push((b"sBIT", vec![5; n]));
+                            extra.push((b"eXIf", exif[..(w * h) as usize % 5000].to_vec()));
+                            extra.push((b"tEXt", b"Comment\0some text".to_vec()));
+                        }
+                        files.push(png(w, h, color, depth, interlaced, &extra, (w * h) as usize + depth as usize));
+                    }
+                }
+            }
+        }
+        // A large chunk, to be read under limits that it exceeds or not.
+        files.push(png(16, 16, 2, 8, false, &[(b"eXIf", exif.clone())], 9));
+        // An animation, through the encoder.
+        let mut apng = Vec::new();
+        {
+            let mut e = crate::Encoder::new(&mut apng, 20, 10);
+            e.set_color(crate::ColorType::Rgba);
+            e.set_animated(3, 0).unwrap();
+            let mut writer = e.write_header().unwrap();
+            for f in 0..3 {
+                writer.write_image_data(&noise(20 * 10 * 4, f)).unwrap();
+            }
+        }
+        files.push(apng);
+        // Damaged copies: a byte changed in the image data, and cut short.
+        for i in 0..files.len() {
+            let mut damaged = files[i].clone();
+            let at = damaged.len() * 3 / 4;
+            damaged[at] ^= 0x5A;
+            files.push(damaged.clone());
+            damaged.truncate(at);
+            files.push(damaged);
+        }
+        files
+    }
+
+    /// Every file decodes in buffers kept from the files before it exactly as in new ones, in every mode: the
+    /// pixels, the errors, what `Info` keeps, and what the limits allow (the chunk buffer's growth is counted as
+    /// a new one's would be).
+    #[test]
+    fn kept_buffers_decode_as_new_ones() {
+        let files = files();
+        let mut scratch = Scratch::default();
+        let mut checked = 0;
+        for transform in [Transformations::IDENTITY, Transformations::EXPAND, Transformations::EXPAND | Transformations::STRIP_16] {
+            for (limit, ignore_text) in [(usize::MAX, false), (usize::MAX, true), (60_000, false), (20_000, false)] {
+                for (i, file) in files.iter().enumerate().chain(files.iter().enumerate().rev()) {
+                    let (fresh, _) = decode(file, transform, limit, ignore_text, Scratch::default());
+                    let (kept, back) = decode(file, transform, limit, ignore_text, scratch);
+                    scratch = back;
+                    assert_eq!(fresh, kept, "file {i}, {transform:?}, limit {limit}");
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, files.len() * 2 * 3 * 4);
+    }
+
+    /// The large chunk is read under a limit it exceeds and one it doesn't, after the buffer grew for it.
+    #[test]
+    fn limits_count_the_chunk_buffer_as_new() {
+        let exif = noise(50_000, 3);
+        let file = png(16, 16, 2, 8, false, &[(b"eXIf", exif)], 9);
+        let (big, scratch) = decode(&file, Transformations::EXPAND, usize::MAX, false, Scratch::default());
+        assert!(big.frames[0].is_ok());
+        // Upstream reserves the doubled sizes, 128 + 256 + ... up to 65,536: 65,408 bytes.
+        let (small, scratch) = decode(&file, Transformations::EXPAND, 60_000, false, scratch);
+        assert_eq!(small.frames[0], Err(DecodingError::LimitsExceeded.to_string()));
+        let (enough, _) = decode(&file, Transformations::EXPAND, 70_000, false, scratch);
+        assert!(enough.frames[0].is_ok());
     }
 }

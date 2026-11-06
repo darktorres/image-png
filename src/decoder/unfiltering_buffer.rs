@@ -46,7 +46,13 @@ impl UnfilteringBuffer {
     }
 
     /// Create a buffer tuned for filtering rows of the image type.
-    pub fn new(info: &Info<'_>) -> Self {
+    ///
+    /// photo-gallery: in buffers kept from an earlier image ([`Self::into_buffers`]), or new ones (upstream's
+    /// `new`, which went with its last caller). They are emptied first, so they read as new ones: only their
+    /// capacity is kept.
+    pub fn with_buffers(info: &Info<'_>, mut data_stream: Vec<u8>, mut scratch_buffer: Vec<u8>) -> Self {
+        data_stream.clear();
+        scratch_buffer.clear();
         // We don't need all of `info` here so if that becomes a structural problem then these
         // derived constants can be extracted into a parameter struct. For instance they may be
         // adjusted according to platform hardware such as cache sizes.
@@ -89,19 +95,29 @@ impl UnfilteringBuffer {
             rowlen_pot.max(128 * 1024)
         };
 
+        data_stream.reserve(data_stream_capacity);
         let result = Self {
-            data_stream: Vec::with_capacity(data_stream_capacity),
+            data_stream,
             prev_row: PrevRow::None,
             current_start: 0,
             filled: 0,
             available: 0,
             shift_back_limit,
             remaining_bytes: u64::MAX,
-            scratch_buffer: Vec::new(),
+            scratch_buffer,
         };
 
         result.debug_assert_invariants();
         result
+    }
+
+    /// photo-gallery: the buffers, for [`Self::with_buffers`]. The scratch row is wherever it is at the time.
+    pub fn into_buffers(self) -> (Vec<u8>, Vec<u8>) {
+        let scratch_buffer = match self.prev_row {
+            PrevRow::Scratch(row) if row.capacity() > self.scratch_buffer.capacity() => row,
+            _ => self.scratch_buffer,
+        };
+        (self.data_stream, scratch_buffer)
     }
 
     /// Called to indicate that there is no previous row (e.g. when the current

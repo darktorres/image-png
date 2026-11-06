@@ -25,6 +25,7 @@
 //!  ```
 //!  use std::fs::File;
 //!  use std::io::BufReader;
+//!  use std::iter::FromIterator;
 //!  use std::path::PathBuf;
 //!
 //!  // Opening a png file that has a zTXt chunk
@@ -51,6 +52,7 @@
 //!  # use std::env;
 //!  # use std::fs::File;
 //!  # use std::io::BufWriter;
+//!  # use std::iter::FromIterator;
 //!  # use std::path::PathBuf;
 //!  # let file = File::create(PathBuf::from_iter(["target", "text_chunk.png"])).unwrap();
 //!  # let ref mut w = BufWriter::new(file);
@@ -100,7 +102,7 @@ use crate::{chunk, encoder, DecodingError, EncodingError};
 use fdeflate::BoundedDecompressionError;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use std::io::Write;
+use std::{convert::TryFrom, io::Write};
 
 /// Default decompression limit for compressed text chunks.
 pub const DECOMPRESSION_LIMIT: usize = 2097152; // 2 MiB
@@ -152,7 +154,7 @@ pub struct TEXtChunk {
     pub text: String,
 }
 
-pub(crate) fn decode_iso_8859_1(text: &[u8]) -> String {
+fn decode_iso_8859_1(text: &[u8]) -> String {
     text.iter().map(|&b| b as char).collect()
 }
 

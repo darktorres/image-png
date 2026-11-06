@@ -2,9 +2,9 @@
 use crate::text_metadata::{ITXtChunk, TEXtChunk, ZTXtChunk};
 #[allow(unused_imports)] // used by doc comments only
 use crate::Filter;
-use crate::{chunk, chunk::ChunkType, encoder};
+use crate::{chunk, encoder};
 use io::Write;
-use std::{borrow::Cow, fmt, io};
+use std::{borrow::Cow, convert::TryFrom, fmt, io};
 
 /// Describes how a pixel is encoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,36 +161,6 @@ impl Unit {
         match n {
             0 => Some(Unit::Unspecified),
             1 => Some(Unit::Meter),
-            _ => None,
-        }
-    }
-}
-
-/// Image offset, as stored in the `oFFs` chunk
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ImageOffset {
-    /// Offset on the X axis, relative to the left edge of the page or screen
-    pub x: i32,
-    /// Offset on the Y axis, relative to the top edge of the page or screen
-    pub y: i32,
-    /// Either *Pixel* or *Micrometer*
-    pub unit: OffsetUnit,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-/// Physical unit of the image offset
-pub enum OffsetUnit {
-    Pixel = 0,
-    Micrometer = 1,
-}
-
-impl OffsetUnit {
-    /// u8 -> Self. Temporary solution until Rust provides a canonical one.
-    pub fn from_u8(n: u8) -> Option<OffsetUnit> {
-        match n {
-            0 => Some(OffsetUnit::Pixel),
-            1 => Some(OffsetUnit::Micrometer),
             _ => None,
         }
     }
@@ -675,13 +645,6 @@ pub struct ContentLightLevelInfo {
     pub max_frame_average_light_level: u32,
 }
 
-/// A chunk that was captured by the decoder.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CapturedChunk {
-    pub name: ChunkType,
-    pub data: Vec<u8>,
-}
-
 /// PNG info struct
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -697,8 +660,6 @@ pub struct Info<'a> {
     /// The image's `tRNS` chunk, if present; contains the alpha channel of the image's palette, 1 byte per entry.
     pub trns: Option<Cow<'a, [u8]>>,
     pub pixel_dims: Option<PixelDimensions>,
-    /// The image's `oFFs` chunk, if present; the image's offset relative to a larger page or screen.
-    pub image_offset: Option<ImageOffset>,
     /// The image's `PLTE` chunk, if present; contains the RGB channels (in that order) of the image's palettes, 3 bytes per entry (1 per channel).
     pub palette: Option<Cow<'a, [u8]>>,
     /// The contents of the image's gAMA chunk, if present.
@@ -722,8 +683,6 @@ pub struct Info<'a> {
     ///
     /// Presence of this value also indicates that the image conforms to the SRGB color space.
     pub srgb: Option<SrgbRenderingIntent>,
-    /// The ICC profile's name.
-    pub icc_profile_name: Option<String>,
     /// The ICC profile for the image.
     pub icc_profile: Option<Cow<'a, [u8]>>,
     /// The coding-independent code points for video signal type identification of the image.
@@ -740,8 +699,6 @@ pub struct Info<'a> {
     pub compressed_latin1_text: Vec<ZTXtChunk>,
     /// iTXt field
     pub utf8_text: Vec<ITXtChunk>,
-    /// Captured chunks
-    pub captured_chunks: Vec<CapturedChunk>,
 }
 
 impl Default for Info<'_> {
@@ -759,13 +716,11 @@ impl Default for Info<'_> {
             chrm_chunk: None,
             bkgd: None,
             pixel_dims: None,
-            image_offset: None,
             frame_control: None,
             animation_control: None,
             source_gamma: None,
             source_chromaticities: None,
             srgb: None,
-            icc_profile_name: None,
             icc_profile: None,
             coding_independent_code_points: None,
             mastering_display_color_volume: None,
@@ -774,7 +729,6 @@ impl Default for Info<'_> {
             uncompressed_latin1_text: Vec::new(),
             compressed_latin1_text: Vec::new(),
             utf8_text: Vec::new(),
-            captured_chunks: Vec::new(),
         }
     }
 }
@@ -993,8 +947,6 @@ pub(crate) enum ParameterErrorKind {
     /// [`DecodingError::Format`]).  The only case when it is possible to resume after an error
     /// is an `UnexpectedEof` scenario - see [`DecodingError::IoError`].
     PolledAfterFatalError,
-    /// Critical chunks cannot be captured when decoding.
-    CannotCaptureCriticalChunk,
 }
 
 impl From<ParameterErrorKind> for ParameterError {
@@ -1013,9 +965,6 @@ impl fmt::Display for ParameterError {
             PolledAfterEndOfImage => write!(fmt, "End of image has been reached"),
             PolledAfterFatalError => {
                 write!(fmt, "A fatal decoding error has been encounted earlier")
-            }
-            CannotCaptureCriticalChunk => {
-                write!(fmt, "Critical chunks cannot be captured")
             }
         }
     }
